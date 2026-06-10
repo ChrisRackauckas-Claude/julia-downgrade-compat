@@ -52,6 +52,9 @@ minimal versions and fail if your compat bounds are too low.
 
     # Julia version to use with resolver (requires Julia 1.9+)
     # Default: '1' (converted to current runtime Julia major.minor)
+    # Channel aliases like 'lts', 'pre', 'min', 'nightly', or '1.12-nightly'
+    # are accepted and resolve to the current runtime Julia major.minor,
+    # matching what setup-julia installed for that alias.
     julia_version: '1'
 ```
 

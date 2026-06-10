@@ -7,11 +7,21 @@ mode = length(ARGS) >= 3 ? ARGS[3] : "deps"
 current_julia_minor = string(VERSION.major, ".", VERSION.minor)
 julia_version = length(ARGS) >= 4 ? ARGS[4] : current_julia_minor
 
-# Convert "1" to the current running Julia version (e.g., "1.12" for Julia 1.12.3)
-# This ensures the resolved manifest matches the Julia version that will read it
-if julia_version == "1"
+# Convert "1" and channel aliases ("lts", "pre", "min", "nightly", ...) to the
+# current running Julia version (e.g., "1.12" for Julia 1.12.3). The resolver
+# only accepts numeric compat specs, but in CI an alias has already been
+# resolved by setup-julia to the Julia this script runs under, so the runtime
+# version is exactly what the alias refers to. This also ensures the resolved
+# manifest matches the Julia version that will read it.
+if julia_version == "1" || occursin(r"^[A-Za-z]", julia_version)
+    original_spec = julia_version
     julia_version = current_julia_minor
-    @info "Converted julia_version \"1\" to \"$julia_version\" (current Julia version)"
+    @info "Converted julia_version \"$original_spec\" to \"$julia_version\" (current Julia version)"
+elseif (m = match(r"^(\d+\.\d+)-[A-Za-z]", julia_version)) !== nothing
+    # Versioned channel aliases like "1.12-nightly": keep the numeric part
+    original_spec = julia_version
+    julia_version = m.captures[1]
+    @info "Converted julia_version \"$original_spec\" to \"$julia_version\" (numeric prefix of channel alias)"
 end
 
 if julia_version != current_julia_minor

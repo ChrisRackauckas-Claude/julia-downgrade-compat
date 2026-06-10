@@ -59,6 +59,47 @@ end
         end
     end
 
+    # Channel aliases are resolved by setup-julia before the action runs, so the
+    # script maps them to the current runtime Julia major.minor instead of
+    # passing them to the resolver (which only accepts numeric compat specs).
+    @testset "channel alias julia_version specs" begin
+        current_minor = string(VERSION.major, ".", VERSION.minor)
+        for spec in ["lts", "pre", "min", "nightly", "$(current_minor)-nightly"]
+            @testset "julia_version = $spec" begin
+                mktempdir() do dir
+                    cd(dir) do
+                        toml_content = """
+                        name = "TestPackage"
+                        version = "0.1.0"
+
+                        [deps]
+                        JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+                        DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+
+                        [compat]
+                        julia = "1.10"
+                        JSON = "0.20, 0.21"
+                        DataStructures = "0.17, 0.18"
+                        """
+                        write("Project.toml", toml_content)
+
+                        run(`$(Base.julia_cmd()) $downgrade_jl "" "." "deps" $spec`)
+
+                        @test isfile("Manifest.toml")
+                        manifest = TOML.parsefile("Manifest.toml")
+                        deps = manifest["deps"]
+                        deps_JSON = get(deps, "JSON", [])
+                        deps_DataStructures = get(deps, "DataStructures", [])
+                        @test !isempty(deps_JSON)
+                        @test !isempty(deps_DataStructures)
+                        @test startswith(deps_JSON[1]["version"], "0.20")
+                        @test startswith(deps_DataStructures[1]["version"], "0.17")
+                    end
+                end
+            end
+        end
+    end
+
     @testset "forcedeps mode - passes when lower bounds match" begin
         mktempdir() do dir
             cd(dir) do

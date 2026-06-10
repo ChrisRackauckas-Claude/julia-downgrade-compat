@@ -11,7 +11,7 @@ inputs:
     description: 'Downgrade mode: deps (direct dependencies), alldeps (deps + weakdeps), weakdeps (only weakdeps), forcedeps (deps with strict lower bound verification)'
     default: 'alldeps'
   julia_version:
-    description: 'Julia version to use with resolver (default: 1, i.e. current runtime Julia major.minor)'
+    description: 'Julia version to use with resolver. Channel aliases ("1", "lts", "pre", "min", "nightly", "1.12-nightly", ...) resolve to the current runtime Julia major.minor, matching what setup-julia installed for that alias.'
     default: '1'
 runs:
   using: "composite"
