@@ -620,21 +620,26 @@ end
     @testset "source package also a registry dependency gets a single manifest entry" begin
         mktempdir() do dir
             cd(dir) do
-                # A [sources] path package (JSON, using the registry uuid) that is
-                # ALSO a registry dependency of another resolved package
-                # (JSONSchema depends on JSON). The resolver emits a registry
-                # entry for JSON; the path entry must REPLACE it, not duplicate it.
-                mkdir("LocalJSON")
+                # A [sources] path package (OrderedCollections, using the registry
+                # uuid) that is ALSO a registry dependency of another resolved
+                # package (DataStructures depends on OrderedCollections). The
+                # resolver emits a registry entry for OrderedCollections; the
+                # path entry must REPLACE it, not duplicate it. The current
+                # runtime julia_version ("1") is used because [sources] projects
+                # currently fail cross-runtime resolution (1.10-stdlib jlls like
+                # MbedTLS_jll have no source path on a 1.12 runtime) even
+                # without this fix.
+                mkdir("LocalOC")
                 write(
-                    "LocalJSON/Project.toml",
+                    "LocalOC/Project.toml",
                     """
-                    name = "JSON"
-                    uuid = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-                    version = "0.21.4"
+                    name = "OrderedCollections"
+                    uuid = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
+                    version = "1.6.0"
                     """
                 )
-                mkpath("LocalJSON/src")
-                write("LocalJSON/src/JSON.jl", "module JSON\nend\n")
+                mkpath("LocalOC/src")
+                write("LocalOC/src/OrderedCollections.jl", "module OrderedCollections\nend\n")
 
                 toml_content = """
                 name = "TestPackage"
@@ -642,30 +647,30 @@ end
                 version = "0.1.0"
 
                 [deps]
-                JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-                JSONSchema = "7d188eb4-7ad8-530c-ae41-71a32a6d4692"
+                OrderedCollections = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
+                DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
 
                 [compat]
                 julia = "1.10"
-                JSONSchema = "1"
+                DataStructures = "0.18"
 
-                [sources.JSON]
-                path = "LocalJSON"
+                [sources.OrderedCollections]
+                path = "LocalOC"
                 """
                 write("Project.toml", toml_content)
                 mkdir("src")
                 write("src/TestPackage.jl", "module TestPackage\nend\n")
 
-                run(`$(Base.julia_cmd()) $downgrade_jl "" "." "deps" "1.10"`)
+                run(`$(Base.julia_cmd()) $downgrade_jl "" "." "deps" "1"`)
 
                 # The manifest must parse (Pkg rejects duplicate-name entries)
-                # and contain exactly one JSON entry: the path one.
+                # and contain exactly one OrderedCollections entry: the path one.
                 env = Pkg.Types.EnvCache("Project.toml")
                 manifest = TOML.parsefile("Manifest.toml")
-                deps_JSON = manifest["deps"]["JSON"]
-                @test length(deps_JSON) == 1
-                @test deps_JSON[1]["path"] == "LocalJSON"
-                @test deps_JSON[1]["uuid"] == "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+                deps_OC = manifest["deps"]["OrderedCollections"]
+                @test length(deps_OC) == 1
+                @test deps_OC[1]["path"] == "LocalOC"
+                @test deps_OC[1]["uuid"] == "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
             end
         end
     end
