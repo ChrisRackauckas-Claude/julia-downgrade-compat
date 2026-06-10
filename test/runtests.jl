@@ -616,4 +616,57 @@ end
             end
         end
     end
+
+    @testset "source package also a registry dependency gets a single manifest entry" begin
+        mktempdir() do dir
+            cd(dir) do
+                # A [sources] path package (JSON, using the registry uuid) that is
+                # ALSO a registry dependency of another resolved package
+                # (JSONSchema depends on JSON). The resolver emits a registry
+                # entry for JSON; the path entry must REPLACE it, not duplicate it.
+                mkdir("LocalJSON")
+                write(
+                    "LocalJSON/Project.toml",
+                    """
+                    name = "JSON"
+                    uuid = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+                    version = "0.21.4"
+                    """
+                )
+                mkpath("LocalJSON/src")
+                write("LocalJSON/src/JSON.jl", "module JSON\nend\n")
+
+                toml_content = """
+                name = "TestPackage"
+                uuid = "598b003f-0677-49cf-8d2a-39b1658b755a"
+                version = "0.1.0"
+
+                [deps]
+                JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+                JSONSchema = "7d188eb4-7ad8-530c-ae41-71a32a6d4692"
+
+                [compat]
+                julia = "1.10"
+                JSONSchema = "1"
+
+                [sources.JSON]
+                path = "LocalJSON"
+                """
+                write("Project.toml", toml_content)
+                mkdir("src")
+                write("src/TestPackage.jl", "module TestPackage\nend\n")
+
+                run(`$(Base.julia_cmd()) $downgrade_jl "" "." "deps" "1.10"`)
+
+                # The manifest must parse (Pkg rejects duplicate-name entries)
+                # and contain exactly one JSON entry: the path one.
+                env = Pkg.Types.EnvCache("Project.toml")
+                manifest = TOML.parsefile("Manifest.toml")
+                deps_JSON = manifest["deps"]["JSON"]
+                @test length(deps_JSON) == 1
+                @test deps_JSON[1]["path"] == "LocalJSON"
+                @test deps_JSON[1]["uuid"] == "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+            end
+        end
+    end
 end
