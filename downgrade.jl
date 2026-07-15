@@ -139,9 +139,10 @@ function get_source_packages(project_file::String)
     return source_pkgs
 end
 
-struct DirectRuntimePathSource
+struct DirectPathSource
     name::String
     project::Dict{String, Any}
+    project_file::String
 end
 
 function find_project_file(dir::AbstractString)
@@ -153,61 +154,197 @@ function find_project_file(dir::AbstractString)
 end
 
 """
-    collect_direct_runtime_path_sources(project_file) -> Vector{DirectRuntimePathSource}
+    active_project_dependencies(project; include_test_target = false)
 
-Collect direct local path packages that occur in both runtime `[deps]` and
-`[sources]` in `project_file`. Nested path sources are intentionally not
-traversed.
+Return the dependencies active in the project environment. When
+`include_test_target` is true, this also includes extras or weak dependencies
+selected by `[targets].test`.
 """
-function collect_direct_runtime_path_sources(project_file::String)
-    root_file = abspath(project_file)
-    root_dir = dirname(root_file)
-    root_project = TOML.parsefile(root_file)
-    deps = get(root_project, "deps", Dict{String, Any}())
-    sources = get(root_project, "sources", Dict{String, Any}())
-    result = DirectRuntimePathSource[]
+function active_project_dependencies(project; include_test_target = false)
+    deps = Dict{String, Any}(get(project, "deps", Dict{String, Any}()))
+    include_test_target || return deps
 
-    for name in sort!(collect(keys(sources)))
-        haskey(deps, name) || continue
-        source = sources[name]
-        source isa AbstractDict || continue
-        haskey(source, "path") || continue
+    extras = get(project, "extras", Dict{String, Any}())
+    weakdeps = get(project, "weakdeps", Dict{String, Any}())
+    test_target = get(get(project, "targets", Dict{String, Any}()), "test", String[])
+    for name in test_target
+        haskey(deps, name) && continue
+        if haskey(extras, name)
+            deps[name] = extras[name]
+        elseif haskey(weakdeps, name)
+            deps[name] = weakdeps[name]
+        end
+    end
+    return deps
+end
 
-        source_dir = normpath(abspath(joinpath(root_dir, source["path"])))
-        source_file = find_project_file(source_dir)
-        source_file === nothing &&
-            error("Path source $name from $root_file has no project file at $source_dir")
-        source_project = TOML.parsefile(source_file)
-        declared_name = get(source_project, "name", name)
-        declared_name == name ||
-            error("Path source $name from $root_file declares package name $declared_name")
-        declared_uuid = get(source_project, "uuid", nothing)
-        declared_uuid == deps[name] || error(
-            "Path source $name from $root_file has uuid $declared_uuid, expected $(deps[name])"
-        )
-        push!(result, DirectRuntimePathSource(name, source_project))
+"""
+    promote_test_target_path_sources!(project_file) -> Vector{String}
+
+Promote local path packages used only by `[targets].test` into `[deps]` in the
+resolved checkout. `Pkg.test` otherwise treats them as new sandbox dependencies
+and either rejects them as unregistered or re-resolves their dependency graph
+away from the locked minimum versions.
+"""
+function promote_test_target_path_sources!(project_file::String)
+    project = TOML.parsefile(project_file)
+    deps = get!(project, "deps", Dict{String, Any}())
+    extras = get!(project, "extras", Dict{String, Any}())
+    weakdeps = get(project, "weakdeps", Dict{String, Any}())
+    sources = get(project, "sources", Dict{String, Any}())
+    test_target = get(get(project, "targets", Dict{String, Any}()), "test", String[])
+    promoted = String[]
+
+    for name in test_target
+        haskey(deps, name) && continue
+        source = get(sources, name, nothing)
+        (source isa AbstractDict && haskey(source, "path")) || continue
+
+        uuid = get(extras, name, nothing)
+        weak_uuid = get(weakdeps, name, nothing)
+        if uuid === nothing
+            uuid = weak_uuid
+            uuid === nothing && continue
+            extras[name] = uuid
+        elseif weak_uuid !== nothing && weak_uuid != uuid
+            error(
+                "Test-target path source $name has uuid $uuid in [extras], " *
+                    "but $weak_uuid in [weakdeps]"
+            )
+        end
+        if weak_uuid !== nothing
+            delete!(weakdeps, name)
+            isempty(weakdeps) && delete!(project, "weakdeps")
+        end
+        deps[name] = uuid
+        push!(promoted, name)
     end
 
+    isempty(promoted) && return promoted
+    open(project_file, "w") do io
+        TOML.print(io, project)
+    end
+    @info "Promoted test-target path sources into runtime dependencies for locked Pkg.test" promoted
+    return promoted
+end
+
+"""
+    collect_path_sources(project_file; include_test_target = true) -> Vector{DirectPathSource}
+
+Collect local path packages that occur in `[sources]` and are active as runtime
+dependencies or, for the root project, in `[targets].test`. Path sources of
+those packages are followed recursively using runtime dependencies only.
+"""
+function collect_path_sources(project_file::String; include_test_target = true)
+    result = DirectPathSource[]
+    seen = Dict{String, DirectPathSource}()
+
+    function visit(parent_file::String; include_test_target = false)
+        parent_file = abspath(parent_file)
+        parent_dir = dirname(parent_file)
+        parent_project = TOML.parsefile(parent_file)
+        deps = active_project_dependencies(parent_project; include_test_target)
+        sources = get(parent_project, "sources", Dict{String, Any}())
+
+        for name in sort!(collect(keys(sources)))
+            haskey(deps, name) || continue
+            source = sources[name]
+            source isa AbstractDict || continue
+            haskey(source, "path") || continue
+
+            source_dir = normpath(abspath(joinpath(parent_dir, source["path"])))
+            source_file = find_project_file(source_dir)
+            source_file === nothing && error(
+                "Path source $name from $parent_file has no project file at $source_dir"
+            )
+            source_file = abspath(source_file)
+            source_project = TOML.parsefile(source_file)
+            declared_name = get(source_project, "name", name)
+            declared_name == name || error(
+                "Path source $name from $parent_file declares package name $declared_name"
+            )
+            declared_uuid = get(source_project, "uuid", nothing)
+            declared_uuid == deps[name] || error(
+                "Path source $name from $parent_file has uuid $declared_uuid, " *
+                    "expected $(deps[name])"
+            )
+
+            if haskey(seen, name)
+                previous = seen[name]
+                get(previous.project, "uuid", nothing) == declared_uuid || error(
+                    "Path source $name resolves to different uuids"
+                )
+                previous.project_file == source_file || error(
+                    "Path source $name resolves to both $(previous.project_file) and $source_file"
+                )
+                continue
+            end
+
+            path_source = DirectPathSource(name, source_project, source_file)
+            seen[name] = path_source
+            push!(result, path_source)
+            visit(source_file)
+        end
+        return
+    end
+
+    visit(project_file; include_test_target)
     return result
+end
+
+function compat_constraint_string(spec)
+    raw = string(spec)
+    if startswith(raw, "[") && endswith(raw, "]")
+        raw = raw[2:(end - 1)]
+    end
+
+    ranges = map(split(raw, ", ")) do range
+        if (m = match(r"^([0-9]+(?:\.[0-9]+){0,2})-\*$", range)) !== nothing
+            return ">=" * m.captures[1]
+        elseif (
+                m = match(
+                    r"^([0-9]+(?:\.[0-9]+){0,2})-([0-9]+(?:\.[0-9]+){0,2})$",
+                    range
+                )
+            ) !== nothing
+            return m.captures[1] * " - " * m.captures[2]
+        elseif occursin(r"^[1-9][0-9]*\.[0-9]+$", range)
+            return "~" * range
+        elseif occursin(r"^[0-9]+\.[0-9]+\.[0-9]+$", range)
+            return "=" * range
+        end
+        return range
+    end
+    constraint = join(ranges, ", ")
+    Pkg.Versions.semver_spec(constraint) == spec || error(
+        "Could not serialize intersected compat constraint $spec"
+    )
+    return constraint
+end
+
+function intersect_compat_constraints(left::String, right::String)
+    result = intersect(Pkg.Versions.semver_spec(left), Pkg.Versions.semver_spec(right))
+    return isempty(result) ? nothing : compat_constraint_string(result)
 end
 
 """
     add_direct_path_source_dependencies!(merged, project_files)
 
 Add hard registry dependencies that are missing from `merged` but required by a
-direct runtime path source in `project_files`. Dependencies already owned by the
-root project keep the root UUID and compat unchanged. When two path sources add
-the same missing dependency, their UUIDs and any compat strings must agree.
+path source active at runtime or in `[targets].test`. Dependencies
+already owned by the root project keep the root UUID and compat unchanged. When
+two path sources add the same missing dependency, their UUIDs must agree and
+their compat constraints are intersected.
 
-This intentionally does not traverse nested path sources, include dependencies
-from a path package's `[weakdeps]`, or intersect differing compat specifications.
-The locked package build and tests remain responsible for validating root-owned
-dependency versions against the path package.
+This does not include dependencies from a path package's `[weakdeps]` or
+intersect path-package compat constraints with an existing root-owned
+dependency. The locked package build and tests remain responsible for
+validating root-owned dependency versions against the path package.
 """
 function add_direct_path_source_dependencies!(merged, project_files::Vector{String})
     path_sources = reduce(
-        vcat, collect_direct_runtime_path_sources.(project_files);
-        init = DirectRuntimePathSource[]
+        vcat, collect_path_sources.(project_files);
+        init = DirectPathSource[]
     )
     isempty(path_sources) && return
 
@@ -231,7 +368,7 @@ function add_direct_path_source_dependencies!(merged, project_files::Vector{Stri
             if name in root_owned
                 deps[name] == uuid || error(
                     "Root dependency $name has uuid $(deps[name]), but path source " *
-                    "$(source.name) requires $uuid"
+                        "$(source.name) requires $uuid"
                 )
                 continue
             end
@@ -239,7 +376,7 @@ function add_direct_path_source_dependencies!(merged, project_files::Vector{Stri
             if haskey(weakdeps, name)
                 weakdeps[name] == uuid || error(
                     "Root weak dependency $name has uuid $(weakdeps[name]), but path " *
-                    "source $(source.name) requires $uuid"
+                        "source $(source.name) requires $uuid"
                 )
                 deps[name] = uuid
                 delete!(weakdeps, name)
@@ -253,14 +390,16 @@ function add_direct_path_source_dependencies!(merged, project_files::Vector{Stri
             if haskey(promoted_by, name)
                 deps[name] == uuid || error(
                     "Path sources $(promoted_by[name]) and $(source.name) require " *
-                    "$name with different uuids $(deps[name]) and $uuid"
+                        "$name with different uuids $(deps[name]) and $uuid"
                 )
-                if constraint !== nothing && haskey(compat, name) &&
-                        compat[name] != constraint
-                    error(
+                if constraint !== nothing && haskey(compat, name)
+                    existing = compat[name]
+                    intersection = intersect_compat_constraints(existing, constraint)
+                    intersection === nothing && error(
                         "Path sources $(promoted_by[name]) and $(source.name) require " *
-                        "$name with different compat entries $(compat[name]) and $constraint"
+                            "$name with disjoint compat entries $existing and $constraint"
                     )
+                    compat[name] = intersection
                 elseif constraint !== nothing
                     compat[name] = constraint
                 end
@@ -273,7 +412,7 @@ function add_direct_path_source_dependencies!(merged, project_files::Vector{Stri
                 if haskey(compat, name) && compat[name] != constraint
                     error(
                         "Project compat for promoted dependency $name is $(compat[name]), " *
-                        "but path source $(source.name) requires $constraint"
+                            "but path source $(source.name) requires $constraint"
                     )
                 end
                 compat[name] = constraint
@@ -616,9 +755,9 @@ in Project.toml but absent from Manifest.toml" (see #3021). Each such package is
 written back as a path dependency pointing at the same location given in
 `[sources]`, mirroring `add_main_package_to_manifest`.
 
-Note: only packages that are themselves in `[deps]` need to be in this manifest;
-packages sourced solely for a test target are not part of the resolved
-environment. Nested path sources are not followed.
+Packages sourced solely for `[targets].test` are included when this manifest was
+produced from the merged test environment. Active nested path sources are
+included recursively.
 
 If the resolver already emitted a registry entry for a source package (which
 happens whenever another resolved package depends on it), that entry is removed
@@ -628,43 +767,28 @@ dependency on ... is ambiguous". The path source must win, since that is the
 whole point of the `[sources]` override.
 """
 function add_source_packages_to_manifest(
-        manifest_file::String, project_file::String, manifest_dir::AbstractString, source_pkgs)
+        manifest_file::String, project_file::String, manifest_dir::AbstractString, source_pkgs;
+        include_test_target = false
+    )
     isempty(source_pkgs) && return
     if !isfile(manifest_file)
         @warn "Manifest file not found: $manifest_file"
         return
     end
 
-    project = TOML.parsefile(project_file)
-    sources = get(project, "sources", Dict())
-    deps = get(project, "deps", Dict())
-    project_dir = dirname(abspath(project_file))
+    path_sources = collect_path_sources(project_file; include_test_target)
+    isempty(path_sources) && return
     manifest_dir = abspath(manifest_dir)
 
     entry_lines = String[]
     added_pkgs = String[]
-    for pkg in source_pkgs
-        # Only packages that are part of this environment's [deps] belong in its
-        # manifest; sources used only by a test target are not.
-        haskey(deps, pkg) || continue
-        src = get(sources, pkg, nothing)
-        (src isa Dict && haskey(src, "path")) || continue
-
-        source_path = normpath(joinpath(project_dir, src["path"]))
+    for source in path_sources
+        pkg = source.name
+        source_path = dirname(source.project_file)
         pkg_path = relpath(source_path, manifest_dir)
-        candidates = [joinpath(source_path, "Project.toml"),
-                      joinpath(source_path, "JuliaProject.toml")]
-        filter!(isfile, candidates)
-        uuid = get(deps, pkg, nothing)
-        version = nothing
-        hard_deps = String[]
-        if !isempty(candidates)
-            pkg_project = TOML.parsefile(first(candidates))
-            uuid = get(pkg_project, "uuid", uuid)
-            version = get(pkg_project, "version", nothing)
-            append!(hard_deps, keys(get(pkg_project, "deps", Dict{String, Any}())))
-            sort!(hard_deps)
-        end
+        uuid = get(source.project, "uuid", nothing)
+        version = get(source.project, "version", nothing)
+        hard_deps = sort!(collect(keys(get(source.project, "deps", Dict{String, Any}()))))
         if uuid === nothing
             @warn "Could not determine uuid for source package $pkg, skipping manifest entry"
             continue
@@ -724,9 +848,10 @@ function resolve_directory(
     manifest_file = joinpath(dir, "Manifest.toml")
     project = TOML.parsefile(project_file)
 
-    # Check for old-style test dependencies (extras)
-    if haskey(project, "extras") && haskey(project, "targets") && haskey(project["targets"], "test")
-        @info "Project $dir has [extras] and [targets].test, using merged resolution"
+    has_test_target = haskey(project, "targets") && haskey(project["targets"], "test")
+    has_test_dependencies = haskey(project, "extras") || haskey(project, "weakdeps")
+    if has_test_target && has_test_dependencies
+        @info "Project $dir has test dependencies and [targets].test, using merged resolution"
         merged_dir = mktempdir()
         source_pkgs = create_merged_project(project_file, project_file, merged_dir; no_promote)
 
@@ -743,8 +868,12 @@ function resolve_directory(
                 # Add the main package itself and other source packages back to the manifest
                 add_main_package_to_manifest(manifest_file, project_file; path = ".")
                 if !isempty(source_pkgs)
-                    add_source_packages_to_manifest(manifest_file, project_file, dir, source_pkgs)
+                    add_source_packages_to_manifest(
+                        manifest_file, project_file, dir, source_pkgs;
+                        include_test_target = true
+                    )
                 end
+                promote_test_target_path_sources!(project_file)
                 set_manifest_project_hash(manifest_file, project_file)
             end
         finally
@@ -1049,12 +1178,17 @@ if do_merge
                 (main_manifest, main_dir), (test_manifest, test_dir)
             )
             add_source_packages_to_manifest(
-                manifest, main_project_file, manifest_dir, main_source_pkgs
+                manifest, main_project_file, manifest_dir, main_source_pkgs;
+                include_test_target = true
             )
             add_source_packages_to_manifest(
-                manifest, test_project_file, manifest_dir, test_source_pkgs
+                manifest, test_project_file, manifest_dir, test_source_pkgs;
+                include_test_target = true
             )
         end
+
+        promote_test_target_path_sources!(main_project_file)
+        promote_test_target_path_sources!(test_project_file)
 
         # Ensure each manifest has the project hash corresponding to the project
         # that will consume it (main root and test environment respectively).

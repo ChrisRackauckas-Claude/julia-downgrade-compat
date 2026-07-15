@@ -125,17 +125,29 @@ Cross-runtime resolution may fail; matching runtime and target version is recomm
 
 ### Local path sources
 
-For a direct runtime dependency configured with `[sources]` and `path`, the
-action includes hard registry dependencies that are declared by the local
-package but missing from the active project in the minimum-version resolution.
+For a dependency configured with `[sources]` and `path`, including one selected
+only by `[targets].test`, the action includes hard registry dependencies that
+are declared by the local package but missing from the active project in the
+minimum-version resolution. It follows active path sources recursively, so
+local monorepo dependencies remain local throughout the locked build and test.
 Dependencies already declared by the active project retain their compat floor;
 the subsequent locked build and test validate that floor against the local
-package. If two direct path packages add the same missing dependency, their UUID
-and compat strings must match or the action fails.
+package. If two path packages add the same missing dependency, their UUIDs must
+match and their compat constraints must overlap. The action resolves the
+dependency against the intersection of those constraints.
 
-This support is intentionally limited to direct path packages. It does not
-traverse nested path sources, promote their weak dependencies, or intersect
-different compat strings for an existing project dependency.
+When a local path package appears only in `[targets].test`, the action also adds
+it to `[deps]` in the checkout after resolution. This is required because
+`Pkg.test` otherwise handles it as a new sandbox dependency: older Julia
+versions reject the unregistered package, while newer versions can re-resolve
+its dependencies above their locked floors. The original `[extras]` entries,
+`[sources]` entries, and test target remain unchanged. A promoted path package
+from `[weakdeps]` is moved into `[extras]` so older Julia versions retain its
+local source in the test sandbox. `Project.toml` is left modified for the
+subsequent build and test steps.
+
+This support does not promote path-package weak dependencies or intersect
+path-package compat constraints with an existing root-owned dependency.
 
 ## Downgrade Modes
 
