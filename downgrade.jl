@@ -630,6 +630,35 @@ function remove_manifest_entries_by_uuid!(manifest::AbstractDict, uuid::Abstract
     return removed
 end
 
+function path_manifest_entry(project, path)
+    entry = Dict{String, Any}(
+        "path" => path,
+        "uuid" => project["uuid"],
+    )
+
+    hard_deps = sort!(collect(keys(get(project, "deps", Dict{String, Any}()))))
+    isempty(hard_deps) || (entry["deps"] = hard_deps)
+
+    for section in ("extensions", "weakdeps")
+        metadata = get(project, section, nothing)
+        metadata isa AbstractDict && !isempty(metadata) &&
+            (entry[section] = deepcopy(metadata))
+    end
+
+    version = get(project, "version", nothing)
+    version === nothing || (entry["version"] = version)
+    return entry
+end
+
+function replace_manifest_path_entry!(manifest, pkg_name, project, path)
+    uuid = project["uuid"]
+    removed = remove_manifest_entries_by_uuid!(manifest, uuid)
+    deps = get(manifest, "deps", manifest)
+    haskey(deps, pkg_name) && pkg_name ∉ removed && push!(removed, pkg_name)
+    deps[pkg_name] = [path_manifest_entry(project, path)]
+    return removed
+end
+
 """
     add_main_package_to_manifest(manifest_file, main_project_file)
 
@@ -646,7 +675,9 @@ the main package from the registry, so blindly appending the path stanza would
 leave two `[[deps.<MainPkg>]]` entries with the same name and uuid. Pkg then
 rejects the manifest with "Invalid manifest format: ...'s dependency on
 <MainPkg> is ambiguous". The path entry must win, since the main package is
-sourced locally, not from the registry.
+sourced locally, not from the registry. The replacement entry retains the
+package's dependency, weak-dependency, and extension metadata so Pkg can load
+extensions without refreshing the locked manifest.
 """
 function add_main_package_to_manifest(manifest_file::String, main_project_file::String; path::String = ".")
     if !isfile(manifest_file)
@@ -659,50 +690,22 @@ function add_main_package_to_manifest(manifest_file::String, main_project_file::
     # Get main package info
     pkg_name = get(main_project, "name", nothing)
     pkg_uuid = get(main_project, "uuid", nothing)
-    pkg_version = get(main_project, "version", nothing)
-
     if pkg_name === nothing || pkg_uuid === nothing
         @warn "Main project missing name or uuid, cannot add to manifest"
         return
     end
 
-    # Drop any resolver-emitted entry for the main package (matched by uuid, so
-    # a renamed-but-same-package stanza is still caught) before appending the
-    # path stanza; a duplicate would make the manifest invalid.
     manifest = TOML.parsefile(manifest_file)
-    removed = remove_manifest_entries_by_uuid!(manifest, pkg_uuid)
+    removed = replace_manifest_path_entry!(manifest, pkg_name, main_project, path)
     if !isempty(removed)
-        open(manifest_file, "w") do io
-            TOML.print(io, manifest; sorted = true)
-        end
         @info "Removed resolver-emitted registry entry for main package $pkg_name"
     end
 
-    # Read the manifest content as text to preserve formatting
-    manifest_content = read(manifest_file, String)
-
-    # Build the entry for the main package
-    entry_lines = String[]
-    push!(entry_lines, "[[deps.$pkg_name]]")
-    push!(entry_lines, "path = \"$path\"")
-    push!(entry_lines, "uuid = \"$pkg_uuid\"")
-    if pkg_version !== nothing
-        push!(entry_lines, "version = \"$pkg_version\"")
-    end
-    push!(entry_lines, "")
-
-    main_pkg_entry = join(entry_lines, "\n")
-
-    # Append the main package entry to the manifest
     open(manifest_file, "w") do io
-        print(io, manifest_content)
-        if !endswith(manifest_content, "\n")
-            println(io)
-        end
-        print(io, main_pkg_entry)
+        TOML.print(io, manifest; sorted = true)
     end
 
-    @info "Added main package $pkg_name to manifest"
+    return @info "Added main package $pkg_name to manifest"
 end
 
 """
@@ -753,7 +756,8 @@ though they remain in the project's `[deps]`. Without this, the build step fails
 with errors like "expected package X to be listed in the manifest" / "X is listed
 in Project.toml but absent from Manifest.toml" (see #3021). Each such package is
 written back as a path dependency pointing at the same location given in
-`[sources]`, mirroring `add_main_package_to_manifest`.
+`[sources]`, mirroring `add_main_package_to_manifest`. Dependency,
+weak-dependency, and extension metadata is copied from each source project.
 
 Packages sourced solely for `[targets].test` are included when this manifest was
 produced from the merged test environment. Active nested path sources are
@@ -780,51 +784,29 @@ function add_source_packages_to_manifest(
     isempty(path_sources) && return
     manifest_dir = abspath(manifest_dir)
 
-    entry_lines = String[]
     added_pkgs = String[]
+    manifest = TOML.parsefile(manifest_file)
+    manifest_deps = get(manifest, "deps", manifest)
     for source in path_sources
         pkg = source.name
         source_path = dirname(source.project_file)
         pkg_path = relpath(source_path, manifest_dir)
         uuid = get(source.project, "uuid", nothing)
-        version = get(source.project, "version", nothing)
-        hard_deps = sort!(collect(keys(get(source.project, "deps", Dict{String, Any}()))))
         if uuid === nothing
             @warn "Could not determine uuid for source package $pkg, skipping manifest entry"
             continue
         end
 
-        push!(entry_lines, "[[deps.$pkg]]")
-        isempty(hard_deps) || push!(entry_lines, "deps = $(repr(hard_deps))")
-        push!(entry_lines, "path = \"$pkg_path\"")
-        push!(entry_lines, "uuid = \"$uuid\"")
-        version !== nothing && push!(entry_lines, "version = \"$version\"")
-        push!(entry_lines, "")
+        had_registry_entry = haskey(manifest_deps, pkg)
+        replace_manifest_path_entry!(manifest, pkg, source.project, pkg_path)
+        had_registry_entry &&
+            @info "Removed resolver-emitted registry entry for source package $pkg"
         push!(added_pkgs, pkg)
         @info "Added source package $pkg to manifest as a path dependency"
     end
-    isempty(entry_lines) && return
-
-    # Drop any resolver-emitted registry entries for the packages we are about
-    # to add as path entries; a duplicate [[deps.X]] makes the manifest invalid.
-    manifest = TOML.parsefile(manifest_file)
-    manifest_deps = get(manifest, "deps", Dict{String, Any}())
-    replaced = filter(pkg -> haskey(manifest_deps, pkg), added_pkgs)
-    if !isempty(replaced)
-        for pkg in replaced
-            delete!(manifest_deps, pkg)
-            @info "Removed resolver-emitted registry entry for source package $pkg"
-        end
-        open(manifest_file, "w") do io
-            TOML.print(io, manifest; sorted = true)
-        end
-    end
-
-    manifest_content = read(manifest_file, String)
-    open(manifest_file, "w") do io
-        print(io, manifest_content)
-        endswith(manifest_content, "\n") || println(io)
-        print(io, join(entry_lines, "\n"))
+    isempty(added_pkgs) && return
+    return open(manifest_file, "w") do io
+        TOML.print(io, manifest; sorted = true)
     end
 end
 
@@ -865,6 +847,10 @@ function resolve_directory(
             if isfile(merged_manifest)
                 cp(merged_manifest, manifest_file; force = true)
 
+                # Promote path-backed test dependencies before recording the main
+                # package so its manifest dependency list matches the final project.
+                promote_test_target_path_sources!(project_file)
+
                 # Add the main package itself and other source packages back to the manifest
                 add_main_package_to_manifest(manifest_file, project_file; path = ".")
                 if !isempty(source_pkgs)
@@ -873,7 +859,6 @@ function resolve_directory(
                         include_test_target = true
                     )
                 end
-                promote_test_target_path_sources!(project_file)
                 set_manifest_project_hash(manifest_file, project_file)
             end
         finally
@@ -1168,6 +1153,11 @@ if do_merge
         cp(merged_manifest, test_manifest; force = true)
         @info "Copied merged manifest to $test_manifest"
 
+        # Promote path-backed test dependencies before recording the main
+        # package so its manifest dependency list matches the final project.
+        promote_test_target_path_sources!(main_project_file)
+        promote_test_target_path_sources!(test_project_file)
+
         # Add the main package itself to the manifest as a path dependency
         # This is needed for workspace projects where the test project depends on the main package
         add_main_package_to_manifest(main_manifest, main_project_file; path = ".")
@@ -1186,10 +1176,6 @@ if do_merge
                 include_test_target = true
             )
         end
-
-        promote_test_target_path_sources!(main_project_file)
-        promote_test_target_path_sources!(test_project_file)
-
         # Ensure each manifest has the project hash corresponding to the project
         # that will consume it (main root and test environment respectively).
         set_manifest_project_hash(main_manifest, main_project_file)

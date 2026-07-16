@@ -534,6 +534,8 @@ end
                 @test devtool["path"] == "../DevTool"
                 @test Set(devtool["deps"]) == Set(["DataStructures"])
                 @test only(manifest["deps"]["WeakTool"])["path"] == "../WeakTool"
+                @test Set(only(manifest["deps"]["SubPackage"])["deps"]) ==
+                    Set(["DevTool", "JSON", "WeakTool"])
                 run(`$(Base.julia_cmd()) --project=SubPackage -e 'using Pkg; Pkg.test(; allow_reresolve = false)'`)
 
                 # Pkg.test only preserves the locked path package when it is a
@@ -603,32 +605,53 @@ end
             cd(dir) do
                 # Locally-developed dependency referenced by path.
                 mkdir("CorePkg")
-                write("CorePkg/Project.toml", """
-                name = "CorePkg"
-                uuid = "33333333-3333-3333-3333-333333333333"
-                version = "1.2.3"
-                """)
+                write(
+                    "CorePkg/Project.toml", """
+                    name = "CorePkg"
+                    uuid = "33333333-3333-3333-3333-333333333333"
+                    version = "1.2.3"
+
+                    [weakdeps]
+                    JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+
+                    [extensions]
+                    CorePkgJSONExt = "JSON"
+                    """
+                )
                 mkdir("CorePkg/src")
-                write("CorePkg/src/CorePkg.jl", "module CorePkg\nend\n")
+                write(
+                    "CorePkg/src/CorePkg.jl",
+                    "module CorePkg\nfunction extension_loaded end\nend\n"
+                )
+                mkdir("CorePkg/ext")
+                write(
+                    "CorePkg/ext/CorePkgJSONExt.jl",
+                    "module CorePkgJSONExt\n" *
+                        "using CorePkg, JSON\n" *
+                        "CorePkg.extension_loaded() = true\n" *
+                        "end\n"
+                )
 
                 # Package under test: a registry dep plus a path-sourced dep in [deps].
                 mkdir("SubPackage")
-                write("SubPackage/Project.toml", """
-                name = "SubPackage"
-                uuid = "44444444-4444-4444-4444-444444444444"
-                version = "0.1.0"
+                write(
+                    "SubPackage/Project.toml", """
+                    name = "SubPackage"
+                    uuid = "44444444-4444-4444-4444-444444444444"
+                    version = "0.1.0"
 
-                [deps]
-                JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-                CorePkg = "33333333-3333-3333-3333-333333333333"
+                    [deps]
+                    JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+                    CorePkg = "33333333-3333-3333-3333-333333333333"
 
-                [sources]
-                CorePkg = {path = "../CorePkg"}
+                    [sources]
+                    CorePkg = {path = "../CorePkg"}
 
-                [compat]
-                julia = "1.10"
-                JSON = "0.20, 0.21"
-                """)
+                    [compat]
+                    julia = "1.10"
+                    JSON = "0.20, 0.21"
+                    """
+                )
 
                 run(`$(Base.julia_cmd()) $downgrade_jl "" "SubPackage" "deps" "1.10"`)
 
@@ -648,10 +671,14 @@ end
                 @test core_entry[1]["path"] == "../CorePkg"
                 @test core_entry[1]["uuid"] == "33333333-3333-3333-3333-333333333333"
                 @test core_entry[1]["version"] == "1.2.3"
+                @test core_entry[1]["extensions"]["CorePkgJSONExt"] == "JSON"
+                @test core_entry[1]["weakdeps"]["JSON"] ==
+                    "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+                run(`$(Base.julia_cmd()) --project=SubPackage -e 'using CorePkg, JSON; CorePkg.extension_loaded() || error("path-source extension did not load")'`)
 
                 # Project hash matches what Pkg expects for the restored project.
                 @test manifest["project_hash"] ==
-                      expected_project_hash(joinpath(dir, "SubPackage", "Project.toml"))
+                    expected_project_hash(joinpath(dir, "SubPackage", "Project.toml"))
             end
         end
     end
