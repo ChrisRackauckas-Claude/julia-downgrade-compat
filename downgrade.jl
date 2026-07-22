@@ -179,21 +179,19 @@ function active_project_dependencies(project; include_test_target = false)
 end
 
 """
-    promote_test_target_path_sources!(project_file) -> Vector{String}
+    test_target_path_sources(project_file) -> Vector{String}
 
-Promote local path packages used only by `[targets].test` into `[deps]` in the
-resolved checkout. `Pkg.test` otherwise treats them as new sandbox dependencies
-and either rejects them as unregistered or re-resolves their dependency graph
-away from the locked minimum versions.
+Return local path packages selected by `[targets].test` but absent from runtime
+`[deps]`.
 """
-function promote_test_target_path_sources!(project_file::String)
+function test_target_path_sources(project_file::String)
     project = TOML.parsefile(project_file)
-    deps = get!(project, "deps", Dict{String, Any}())
-    extras = get!(project, "extras", Dict{String, Any}())
+    deps = get(project, "deps", Dict{String, Any}())
+    extras = get(project, "extras", Dict{String, Any}())
     weakdeps = get(project, "weakdeps", Dict{String, Any}())
     sources = get(project, "sources", Dict{String, Any}())
     test_target = get(get(project, "targets", Dict{String, Any}()), "test", String[])
-    promoted = String[]
+    result = String[]
 
     for name in test_target
         haskey(deps, name) && continue
@@ -205,27 +203,101 @@ function promote_test_target_path_sources!(project_file::String)
         if uuid === nothing
             uuid = weak_uuid
             uuid === nothing && continue
-            extras[name] = uuid
         elseif weak_uuid !== nothing && weak_uuid != uuid
             error(
                 "Test-target path source $name has uuid $uuid in [extras], " *
                     "but $weak_uuid in [weakdeps]"
             )
         end
-        if weak_uuid !== nothing
-            delete!(weakdeps, name)
-            isempty(weakdeps) && delete!(project, "weakdeps")
-        end
-        deps[name] = uuid
-        push!(promoted, name)
+        push!(result, name)
     end
 
-    isempty(promoted) && return promoted
+    return result
+end
+
+"""
+    prepare_test_target_path_sources!(project_file; registry_deps) -> Vector{String}
+
+Prepare test-only path sources for a locked `Pkg.test` and return their names.
+Weak-only sources are also added to `[extras]`, as Pkg requires every
+`[sources]` entry there or in `[deps]`. On Julia 1.11 and newer, hard registry
+dependencies used only through these sources are promoted to runtime `[deps]`
+so `Pkg.test` preserves their resolved versions. Julia 1.10 and earlier instead
+require the path sources themselves in runtime `[deps]` because their test
+sandbox does not honor `[sources]`.
+"""
+function prepare_test_target_path_sources!(
+        project_file::String; registry_deps = Dict{String, Any}())
+    names = test_target_path_sources(project_file)
+
+    project = TOML.parsefile(project_file)
+    deps = VERSION < v"1.11" || !isempty(registry_deps) ?
+           get!(project, "deps", Dict{String, Any}()) :
+           get(project, "deps", Dict{String, Any}())
+    extras = get!(project, "extras", Dict{String, Any}())
+    weakdeps = get(project, "weakdeps", Dict{String, Any}())
+    changed = false
+    anchored = String[]
+    added_extras = String[]
+
+    if VERSION >= v"1.11"
+        for name in sort!(collect(keys(registry_deps)))
+            uuid = registry_deps[name]
+            for (section, entries) in (("[deps]", deps), ("[extras]", extras),
+                    ("[weakdeps]", weakdeps))
+                haskey(entries, name) || continue
+                entries[name] == uuid || error(
+                    "Test-only path-source dependency $name has uuid $uuid, " *
+                        "but $(entries[name]) in $section"
+                )
+            end
+
+            if haskey(weakdeps, name)
+                delete!(weakdeps, name)
+                isempty(weakdeps) && delete!(project, "weakdeps")
+                changed = true
+            end
+            if !haskey(deps, name)
+                deps[name] = uuid
+                changed = true
+                push!(anchored, name)
+            end
+        end
+    end
+
+    for name in names
+        uuid = get(extras, name, nothing)
+        weak_uuid = get(weakdeps, name, nothing)
+        if uuid === nothing
+            uuid = weak_uuid
+            extras[name] = uuid
+            changed = true
+            push!(added_extras, name)
+        end
+        if VERSION < v"1.11"
+            if weak_uuid !== nothing
+                delete!(weakdeps, name)
+                isempty(weakdeps) && delete!(project, "weakdeps")
+            end
+            deps[name] = uuid
+            changed = true
+        end
+    end
+
+    changed || return names
     open(project_file, "w") do io
         TOML.print(io, project)
     end
-    @info "Promoted test-target path sources into runtime dependencies for locked Pkg.test" promoted
-    return promoted
+    if !isempty(anchored)
+        @info "Promoted test-only path-source dependencies for locked Pkg.test" anchored
+    end
+    if !isempty(added_extras)
+        @info "Added weak-only test-target path sources to [extras] for Pkg validation" added_extras
+    end
+    if VERSION < v"1.11" && !isempty(names)
+        @info "Promoted test-target path sources for Julia $(VERSION.major).$(VERSION.minor) Pkg.test compatibility" names
+    end
+    return names
 end
 
 """
@@ -292,6 +364,50 @@ function collect_path_sources(project_file::String; include_test_target = true)
     return result
 end
 
+"""
+    test_only_path_source_dependencies(project_file; no_promote) -> Dict{String, Any}
+
+Return hard non-local dependencies introduced by path sources that are active
+only through `[targets].test`. Julia 1.11 and newer must see these as root
+dependencies or `Pkg.test` resolves that test-only graph independently of the
+locked manifest.
+"""
+function test_only_path_source_dependencies(
+        project_file::String; no_promote = String[])
+    all_sources = collect_path_sources(project_file; include_test_target = true)
+    runtime_source_names = Set(
+        source.name for source in
+        collect_path_sources(project_file; include_test_target = false)
+    )
+    local_source_names = Set(source.name for source in all_sources)
+    result = Dict{String, Any}()
+    owners = Dict{String, String}()
+
+    for source in all_sources
+        source.name in runtime_source_names && continue
+        for name in sort!(collect(keys(get(source.project, "deps", Dict{String, Any}()))))
+            name in local_source_names && continue
+            name in no_promote && continue
+            uuid = source.project["deps"][name]
+            if haskey(result, name) && result[name] != uuid
+                error(
+                    "Test-only path sources $(owners[name]) and $(source.name) require " *
+                        "$name with different uuids $(result[name]) and $uuid"
+                )
+            end
+            result[name] = uuid
+            owners[name] = source.name
+        end
+    end
+    return result
+end
+
+function parse_compat_constraint(constraint)
+    # Pkg exposes no public top-level parser for Project.toml's compat grammar.
+    # Keep the internal access isolated here instead of duplicating that grammar.
+    return Pkg.Versions.semver_spec(constraint)
+end
+
 function compat_constraint_string(spec)
     raw = string(spec)
     if startswith(raw, "[") && endswith(raw, "]")
@@ -316,15 +432,31 @@ function compat_constraint_string(spec)
         return range
     end
     constraint = join(ranges, ", ")
-    Pkg.Versions.semver_spec(constraint) == spec || error(
+    parse_compat_constraint(constraint) == spec || error(
         "Could not serialize intersected compat constraint $spec"
     )
     return constraint
 end
 
 function intersect_compat_constraints(left::String, right::String)
-    result = intersect(Pkg.Versions.semver_spec(left), Pkg.Versions.semver_spec(right))
+    result = intersect(parse_compat_constraint(left), parse_compat_constraint(right))
     return isempty(result) ? nothing : compat_constraint_string(result)
+end
+
+function merge_compat_constraint!(compat, name, constraint, owners)
+    constraint === nothing && return
+    if !haskey(compat, name)
+        compat[name] = constraint
+        return
+    end
+
+    existing = compat[name]
+    intersection = intersect_compat_constraints(existing, constraint)
+    intersection === nothing && error(
+        "$owners require $name with disjoint compat entries $existing and $constraint"
+    )
+    compat[name] = intersection
+    return
 end
 
 """
@@ -332,14 +464,12 @@ end
 
 Add hard registry dependencies that are missing from `merged` but required by a
 path source active at runtime or in `[targets].test`. Dependencies
-already owned by the root project keep the root UUID and compat unchanged. When
-two path sources add the same missing dependency, their UUIDs must agree and
-their compat constraints are intersected.
+already owned by the root project keep the root UUID, and their compat is
+intersected with each path source's constraint. When two path sources add the
+same missing dependency, their UUIDs must agree and their compat constraints are
+intersected.
 
-This does not include dependencies from a path package's `[weakdeps]` or
-intersect path-package compat constraints with an existing root-owned
-dependency. The locked package build and tests remain responsible for
-validating root-owned dependency versions against the path package.
+This does not include dependencies from a path package's `[weakdeps]`.
 """
 function add_direct_path_source_dependencies!(merged, project_files::Vector{String})
     path_sources = reduce(
@@ -360,6 +490,7 @@ function add_direct_path_source_dependencies!(merged, project_files::Vector{Stri
         source_compat = get(source.project, "compat", Dict{String, Any}())
         for name in sort!(collect(keys(source_deps)))
             uuid = source_deps[name]
+            constraint = get(source_compat, name, nothing)
             if name in local_source_names
                 @info "Leaving direct path dependency $name local while reading $(source.name)"
                 continue
@@ -369,6 +500,9 @@ function add_direct_path_source_dependencies!(merged, project_files::Vector{Stri
                 deps[name] == uuid || error(
                     "Root dependency $name has uuid $(deps[name]), but path source " *
                         "$(source.name) requires $uuid"
+                )
+                merge_compat_constraint!(
+                    compat, name, constraint, "Root project and path source $(source.name)"
                 )
                 continue
             end
@@ -383,26 +517,21 @@ function add_direct_path_source_dependencies!(merged, project_files::Vector{Stri
                 isempty(weakdeps) && delete!(merged, "weakdeps")
                 push!(root_owned, name)
                 @info "Promoting root weak dependency required by $(source.name): $name"
+                merge_compat_constraint!(
+                    compat, name, constraint, "Root project and path source $(source.name)"
+                )
                 continue
             end
 
-            constraint = get(source_compat, name, nothing)
             if haskey(promoted_by, name)
                 deps[name] == uuid || error(
                     "Path sources $(promoted_by[name]) and $(source.name) require " *
                         "$name with different uuids $(deps[name]) and $uuid"
                 )
-                if constraint !== nothing && haskey(compat, name)
-                    existing = compat[name]
-                    intersection = intersect_compat_constraints(existing, constraint)
-                    intersection === nothing && error(
-                        "Path sources $(promoted_by[name]) and $(source.name) require " *
-                            "$name with disjoint compat entries $existing and $constraint"
-                    )
-                    compat[name] = intersection
-                elseif constraint !== nothing
-                    compat[name] = constraint
-                end
+                merge_compat_constraint!(
+                    compat, name, constraint,
+                    "Path sources $(promoted_by[name]) and $(source.name)"
+                )
                 continue
             end
 
@@ -430,7 +559,7 @@ Create a merged Project.toml that combines dependencies from both the main
 project and test project. This ensures that when tests run (which combine
 both environments), the resolved versions are compatible.
 
-Returns a Set of source packages that were excluded from the merge.
+Returns the source packages excluded from the merge.
 """
 function create_merged_project(main_project_file::String, test_project_file::String, merged_dir::String;
         no_promote = String[])
@@ -679,7 +808,8 @@ sourced locally, not from the registry. The replacement entry retains the
 package's dependency, weak-dependency, and extension metadata so Pkg can load
 extensions without refreshing the locked manifest.
 """
-function add_main_package_to_manifest(manifest_file::String, main_project_file::String; path::String = ".")
+function add_main_package_to_manifest(
+        manifest_file::String, main_project_file::String; path::String = ".")
     if !isfile(manifest_file)
         @warn "Manifest file not found: $manifest_file"
         return
@@ -835,7 +965,8 @@ function resolve_directory(
     if has_test_target && has_test_dependencies
         @info "Project $dir has test dependencies and [targets].test, using merged resolution"
         merged_dir = mktempdir()
-        source_pkgs = create_merged_project(project_file, project_file, merged_dir; no_promote)
+        source_pkgs = create_merged_project(
+            project_file, project_file, merged_dir; no_promote)
 
         try
             @info "Running resolver on merged project (extras) for $dir with --min=@$resolver_mode"
@@ -847,11 +978,13 @@ function resolve_directory(
             if isfile(merged_manifest)
                 cp(merged_manifest, manifest_file; force = true)
 
-                # Promote path-backed test dependencies before recording the main
-                # package so its manifest dependency list matches the final project.
-                promote_test_target_path_sources!(project_file)
-
                 # Add the main package itself and other source packages back to the manifest
+                prepare_test_target_path_sources!(
+                    project_file;
+                    registry_deps = test_only_path_source_dependencies(
+                        project_file; no_promote
+                    )
+                )
                 add_main_package_to_manifest(manifest_file, project_file; path = ".")
                 if !isempty(source_pkgs)
                     add_source_packages_to_manifest(
@@ -1135,7 +1268,8 @@ if do_merge
 
     # Create merged project in temp directory
     merged_dir = mktempdir()
-    source_pkgs = create_merged_project(main_project_file, test_project_file, merged_dir; no_promote)
+    source_pkgs = create_merged_project(
+        main_project_file, test_project_file, merged_dir; no_promote)
 
     # Run resolver on merged project
     @info "Running resolver on merged project with --min=@$resolver_mode"
@@ -1153,15 +1287,18 @@ if do_merge
         cp(merged_manifest, test_manifest; force = true)
         @info "Copied merged manifest to $test_manifest"
 
-        # Promote path-backed test dependencies before recording the main
-        # package so its manifest dependency list matches the final project.
-        promote_test_target_path_sources!(main_project_file)
-        promote_test_target_path_sources!(test_project_file)
-
-        # Add the main package itself to the manifest as a path dependency
-        # This is needed for workspace projects where the test project depends on the main package
-        add_main_package_to_manifest(main_manifest, main_project_file; path = ".")
-        add_main_package_to_manifest(test_manifest, main_project_file; path = "..")
+        prepare_test_target_path_sources!(
+            main_project_file;
+            registry_deps = test_only_path_source_dependencies(
+                main_project_file; no_promote
+            )
+        )
+        prepare_test_target_path_sources!(
+            test_project_file;
+            registry_deps = test_only_path_source_dependencies(
+                test_project_file; no_promote
+            )
+        )
         main_source_pkgs = get_source_packages(main_project_file)
         test_source_pkgs = get_source_packages(test_project_file)
         for (manifest, manifest_dir) in (
@@ -1176,6 +1313,10 @@ if do_merge
                 include_test_target = true
             )
         end
+        # Add this last because test/Project.toml commonly lists the main
+        # package as a path source, which would otherwise replace this entry.
+        add_main_package_to_manifest(main_manifest, main_project_file; path = ".")
+        add_main_package_to_manifest(test_manifest, main_project_file; path = "..")
         # Ensure each manifest has the project hash corresponding to the project
         # that will consume it (main root and test environment respectively).
         set_manifest_project_hash(main_manifest, main_project_file)

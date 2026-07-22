@@ -521,6 +521,8 @@ end
                         "@test WeakTool.loaded()\n"
                 )
 
+                original_project = read(joinpath("SubPackage", "Project.toml"), String)
+
                 # Before the fix this throws a ProcessFailedException.
                 run(`$(Base.julia_cmd()) $downgrade_jl "" "SubPackage" "deps" "1"`)
 
@@ -534,23 +536,34 @@ end
                 @test devtool["path"] == "../DevTool"
                 @test Set(devtool["deps"]) == Set(["DataStructures"])
                 @test only(manifest["deps"]["WeakTool"])["path"] == "../WeakTool"
+                expected_main_deps = VERSION >= v"1.11" ?
+                                     Set(["DataStructures", "JSON"]) :
+                                     Set(["DevTool", "JSON", "WeakTool"])
                 @test Set(only(manifest["deps"]["SubPackage"])["deps"]) ==
-                    Set(["DevTool", "JSON", "WeakTool"])
+                    expected_main_deps
                 run(`$(Base.julia_cmd()) --project=SubPackage -e 'using Pkg; Pkg.test(; allow_reresolve = false)'`)
 
-                # Pkg.test only preserves the locked path package when it is a
-                # runtime dependency. Its source and test target remain intact.
                 restored = TOML.parsefile(joinpath("SubPackage", "Project.toml"))
                 @test restored["targets"]["test"] == ["DevTool", "Test", "WeakTool"]
                 @test haskey(restored["sources"], "DevTool")
                 @test haskey(restored["sources"], "WeakTool")
-                @test restored["deps"]["DevTool"] ==
-                    "11111111-1111-1111-1111-111111111111"
-                @test restored["deps"]["WeakTool"] ==
-                    "77777777-7777-7777-7777-777777777777"
                 @test haskey(restored["extras"], "DevTool")
                 @test haskey(restored["extras"], "WeakTool")
-                @test !haskey(restored, "weakdeps")
+                if VERSION >= v"1.11"
+                    @test read(joinpath("SubPackage", "Project.toml"), String) !=
+                        original_project
+                    @test restored["deps"]["DataStructures"] ==
+                        "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+                    @test !haskey(restored["deps"], "DevTool")
+                    @test !haskey(restored["deps"], "WeakTool")
+                    @test haskey(restored, "weakdeps")
+                else
+                    @test restored["deps"]["DevTool"] ==
+                        "11111111-1111-1111-1111-111111111111"
+                    @test restored["deps"]["WeakTool"] ==
+                        "77777777-7777-7777-7777-777777777777"
+                    @test !haskey(restored, "weakdeps")
+                end
 
                 mkdir("WeakOnlyPackage")
                 write(
@@ -584,14 +597,27 @@ end
                     "using WeakTool\nWeakTool.loaded() || error(\"WeakTool failed to load\")\n"
                 )
 
+                original_weak_project =
+                    read(joinpath("WeakOnlyPackage", "Project.toml"), String)
+
                 run(`$(Base.julia_cmd()) $downgrade_jl "" "WeakOnlyPackage" "deps" "1"`)
                 run(`$(Base.julia_cmd()) --project=WeakOnlyPackage -e 'using Pkg; Pkg.test(; allow_reresolve = false)'`)
                 weak_only = TOML.parsefile(joinpath("WeakOnlyPackage", "Project.toml"))
-                @test weak_only["deps"]["WeakTool"] ==
-                    "77777777-7777-7777-7777-777777777777"
-                @test weak_only["extras"]["WeakTool"] ==
-                    "77777777-7777-7777-7777-777777777777"
-                @test !haskey(weak_only, "weakdeps")
+                if VERSION >= v"1.11"
+                    @test read(joinpath("WeakOnlyPackage", "Project.toml"), String) !=
+                        original_weak_project
+                    @test !haskey(weak_only, "deps")
+                    @test weak_only["extras"]["WeakTool"] ==
+                        "77777777-7777-7777-7777-777777777777"
+                    @test weak_only["weakdeps"]["WeakTool"] ==
+                        "77777777-7777-7777-7777-777777777777"
+                else
+                    @test weak_only["deps"]["WeakTool"] ==
+                        "77777777-7777-7777-7777-777777777777"
+                    @test weak_only["extras"]["WeakTool"] ==
+                        "77777777-7777-7777-7777-777777777777"
+                    @test !haskey(weak_only, "weakdeps")
+                end
             end
         end
     end
@@ -1120,8 +1146,8 @@ end
                     DataStructures = "0.18"
                     julia = "1.10"
                     JSON = "0.21"
-                    Preferences = "~1.4"
-                    StaticArrays = "1.9.8"
+                    Preferences = "1.4.0"
+                    StaticArrays = "1.8, 1.9"
                     """
                 )
                 write(
@@ -1143,7 +1169,7 @@ end
 
                     [compat]
                     julia = "1.10"
-                    Preferences = ">=1.3"
+                    Preferences = "1"
                     StaticArrays = "1.9.8"
                     """
                 )
@@ -1176,7 +1202,6 @@ end
                     LocalB = {path = "LocalB"}
 
                     [compat]
-                    DataStructures = "0.18.0"
                     julia = "1.10"
                     BenchmarkTools = "1.5.0"
                     JSON = "0.21.4"
@@ -1211,6 +1236,8 @@ end
                     Set(["DataStructures", "JSON", "Preferences", "StaticArrays"])
                 @test local_b["path"] == "LocalB"
                 @test Set(local_b["deps"]) == Set(["Preferences", "StaticArrays"])
+                @test Set(only(deps["RootPkg"])["deps"]) ==
+                    Set(["JSON", "LocalA", "LocalB"])
                 run(`$(Base.julia_cmd()) --project=. -e 'using Pkg; Pkg.test(; allow_reresolve = false)'`)
 
                 restored = TOML.parsefile("Project.toml")
@@ -1348,6 +1375,17 @@ end
                 )
                 write("LocalDep/src/LocalDep.jl", "module LocalDep\nusing StaticArrays\nend\n")
 
+                mkpath("LocalTest/src")
+                write(
+                    "LocalTest/Project.toml",
+                    """
+                    name = "LocalTest"
+                    uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+                    version = "0.1.0"
+                    """
+                )
+                write("LocalTest/src/LocalTest.jl", "module LocalTest\nend\n")
+
                 mkpath("src")
                 mkpath("test")
                 write("src/RootPkg.jl", "module RootPkg\nusing LocalDep\nend\n")
@@ -1368,13 +1406,21 @@ end
 
                     [sources]
                     LocalDep = {path = "LocalDep"}
+                    LocalTest = {path = "LocalTest"}
 
                     [compat]
                     julia = "1.10"
                     JSON = "0.21.4"
                     LocalDep = "0.1"
+
+                    [extras]
+                    LocalTest = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+                    [targets]
+                    test = ["LocalTest"]
                     """
                 )
+                original_project = read("Project.toml", String)
                 write(
                     "test/Project.toml",
                     """
@@ -1400,10 +1446,18 @@ end
                 @test only(main_deps["JSON"])["version"] == "0.21.4"
                 @test only(main_deps["BenchmarkTools"])["version"] == "1.5.0"
                 @test only(main_deps["LocalDep"])["path"] == "LocalDep"
+                @test only(main_deps["LocalTest"])["path"] == "LocalTest"
                 @test only(test_deps["LocalDep"])["path"] == "../LocalDep"
+                @test only(test_deps["LocalTest"])["path"] == "../LocalTest"
                 @test only(main_deps["RootPkg"])["path"] == "."
                 @test only(test_deps["RootPkg"])["path"] == ".."
-                @test Set(only(test_deps["RootPkg"])["deps"]) == Set(["JSON", "LocalDep"])
+                expected_root_deps = VERSION >= v"1.11" ?
+                                     Set(["JSON", "LocalDep"]) :
+                                     Set(["JSON", "LocalDep", "LocalTest"])
+                @test Set(only(test_deps["RootPkg"])["deps"]) == expected_root_deps
+                if VERSION >= v"1.11"
+                    @test read("Project.toml", String) == original_project
+                end
 
                 locked = Dict(
                     name => only(test_deps[name])["version"]
@@ -1418,7 +1472,7 @@ end
         end
     end
 
-    @testset "locked tests reject an incompatible root-owned path dependency floor" begin
+    @testset "root and path-source compat constraints must overlap" begin
         mktempdir() do dir
             cd(dir) do
                 mkpath("LocalDep/src")
@@ -1469,22 +1523,20 @@ end
                     """
                 )
 
-                run(`$(Base.julia_cmd()) $downgrade_jl "" "." "deps" "1.10"`)
-                manifest = TOML.parsefile("Manifest.toml")
-                @test only(manifest["deps"]["JSON"])["version"] == "0.21.4"
-
                 output = IOBuffer()
                 process = run(
                     pipeline(
-                        `$(Base.julia_cmd()) --project=. -e 'using Pkg; Pkg.test(; allow_reresolve = false)'`;
+                        `$(Base.julia_cmd()) $downgrade_jl "" "." "deps" "1.10"`;
                         stdout = output, stderr = output
                     ); wait = false
                 )
                 wait(process)
                 log = String(take!(output))
                 @test !success(process)
-                @test occursin("JSON", log)
-                @test occursin("compat", lowercase(log)) || occursin("0.20", log)
+                @test occursin(
+                    "Root project and path source LocalDep require JSON with disjoint compat entries",
+                    log
+                )
             end
         end
     end
