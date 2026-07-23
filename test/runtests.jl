@@ -1678,7 +1678,15 @@ end
                     """
                 )
 
-                run(`$(Base.julia_cmd()) $downgrade_jl "" ".,test" "deps" "1.10"`)
+                # Resolve for the running Julia rather than a fixed target. The
+                # serializer runs during the merge, before the resolver, so the
+                # target is irrelevant to what this checks; matching it to the
+                # runtime keeps resolution single-runtime. DataStructures 0.18.0
+                # resolved for an older target from a newer runtime otherwise pulls
+                # a stdlib JLL absent from the newer depot -- the action's
+                # documented cross-runtime fragility, unrelated to compat serializing.
+                target = string(VERSION.major, '.', VERSION.minor)
+                run(`$(Base.julia_cmd()) $downgrade_jl "" ".,test" "deps" $target`)
 
                 @test isfile("Manifest.toml")
                 manifest = TOML.parsefile("Manifest.toml")
