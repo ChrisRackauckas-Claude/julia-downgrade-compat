@@ -1614,6 +1614,81 @@ end
         end
     end
 
+    @testset "direct path sources intersect overlapping compat for a promoted dependency" begin
+        mktempdir() do dir
+            cd(dir) do
+                # Two path sources constrain a shared registry dependency with
+                # overlapping, lower-bounded-only ranges. Their intersection is
+                # open-upper, so the serializer must emit ">= 0.18.0"; the earlier
+                # string(spec)+regex approach instead emitted the unparseable
+                # "0.18.0 - *" on Julia 1.11+ and aborted the resolution.
+                for (name, uuid, constraint) in (
+                        ("LocalA", "44444444-4444-4444-4444-444444444444", ">= 0.17"),
+                        ("LocalB", "66666666-6666-6666-6666-666666666666", ">= 0.18"),
+                    )
+                    mkpath("$name/src")
+                    write(
+                        "$name/Project.toml",
+                        """
+                        name = "$name"
+                        uuid = "$uuid"
+                        version = "0.1.0"
+
+                        [deps]
+                        DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+
+                        [compat]
+                        DataStructures = "$constraint"
+                        """
+                    )
+                    write("$name/src/$name.jl", "module $name\nend\n")
+                end
+                mkdir("test")
+                write(
+                    "Project.toml",
+                    """
+                    name = "RootPkg"
+                    uuid = "55555555-5555-5555-5555-555555555555"
+                    version = "0.1.0"
+
+                    [deps]
+                    LocalA = "44444444-4444-4444-4444-444444444444"
+
+                    [sources]
+                    LocalA = {path = "LocalA"}
+
+                    [compat]
+                    julia = "1.10"
+                    LocalA = "0.1"
+                    """
+                )
+                write(
+                    "test/Project.toml",
+                    """
+                    [deps]
+                    LocalB = "66666666-6666-6666-6666-666666666666"
+                    RootPkg = "55555555-5555-5555-5555-555555555555"
+
+                    [sources]
+                    LocalB = {path = "../LocalB"}
+                    RootPkg = {path = ".."}
+
+                    [compat]
+                    LocalB = "0.1"
+                    """
+                )
+
+                run(`$(Base.julia_cmd()) $downgrade_jl "" ".,test" "deps" "1.10"`)
+
+                @test isfile("Manifest.toml")
+                manifest = TOML.parsefile("Manifest.toml")
+                # 0.18.0 is the intersection floor; LocalA's ">= 0.17" alone would
+                # resolve to 0.17.x, so this also confirms the intersection applied.
+                @test only(manifest["deps"]["DataStructures"])["version"] == "0.18.0"
+            end
+        end
+    end
+
     @testset "no_promote keeps a named weakdep extension out of the joint resolve" begin
         # The merged resolution promotes every weakdep test-extra into ONE joint
         # floor-resolve -- correct, because the extensions coexist in a single test

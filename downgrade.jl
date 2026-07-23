@@ -403,35 +403,35 @@ function test_only_path_source_dependencies(
 end
 
 function parse_compat_constraint(constraint)
-    # Pkg exposes no public top-level parser for Project.toml's compat grammar.
-    # Keep the internal access isolated here instead of duplicating that grammar.
+    # Pkg exposes no public parser or serializer for Project.toml's compat
+    # grammar. The internal access is isolated here and in compat_constraint_string
+    # instead of duplicating that grammar.
     return Pkg.Versions.semver_spec(constraint)
 end
 
-function compat_constraint_string(spec)
-    raw = string(spec)
-    if startswith(raw, "[") && endswith(raw, "]")
-        raw = raw[2:(end - 1)]
-    end
+# A VersionBound holds up to three significant components in `t`, with `n`
+# recording how many are set (`n == 0` is an unbounded end). These fields are
+# stable across the Julia versions this action supports, unlike the printed form
+# of a VersionSpec, whose hyphen spacing changed between 1.10 and 1.11.
+compat_bound_string(bound) = join(bound.t[1:bound.n], '.')
 
-    ranges = map(split(raw, ", ")) do range
-        if (m = match(r"^([0-9]+(?:\.[0-9]+){0,2})-\*$", range)) !== nothing
-            return ">=" * m.captures[1]
-        elseif (
-                m = match(
-                    r"^([0-9]+(?:\.[0-9]+){0,2})-([0-9]+(?:\.[0-9]+){0,2})$",
-                    range
-                )
-            ) !== nothing
-            return m.captures[1] * " - " * m.captures[2]
-        elseif occursin(r"^[1-9][0-9]*\.[0-9]+$", range)
-            return "~" * range
-        elseif occursin(r"^[0-9]+\.[0-9]+\.[0-9]+$", range)
-            return "=" * range
-        end
-        return range
-    end
-    constraint = join(ranges, ", ")
+function compat_range_string(range)
+    lower, upper = range.lower, range.upper
+    # A [compat] floor always has a lower bound, so intersections of real compat
+    # entries never yield one without it; refuse rather than emit a spec that
+    # semver_spec cannot parse back.
+    lower.n == 0 && error("Cannot serialize a compat constraint with no lower bound")
+    upper.n == 0 && return ">= " * compat_bound_string(lower)
+    return compat_bound_string(lower) * " - " * compat_bound_string(upper)
+end
+
+function compat_constraint_string(spec)
+    # Serialize each VersionRange as an explicit two-endpoint compat range read
+    # from the parsed bounds, so the result round-trips through
+    # parse_compat_constraint independently of how Pkg renders the spec. The
+    # assertion turns any unforeseen range shape into a loud error rather than a
+    # silently wrong constraint.
+    constraint = join((compat_range_string(range) for range in spec.ranges), ", ")
     parse_compat_constraint(constraint) == spec || error(
         "Could not serialize intersected compat constraint $spec"
     )
