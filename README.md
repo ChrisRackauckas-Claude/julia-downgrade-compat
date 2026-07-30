@@ -155,6 +155,27 @@ locked build and test steps.
 
 This support does not promote path-package weak dependencies.
 
+### Old-style test dependencies
+
+A package that declares its test dependencies with `[extras]`/`[weakdeps]` and
+`[targets].test`, rather than a `test/Project.toml`, has no environment of its
+own for `Pkg.test` to lock. Pkg instead synthesizes a sandbox project from
+`[deps]` plus the `[targets].test` names and resolves that, which discards the
+minimum this action resolved for a name reachable only through `[extras]` or
+`[weakdeps]` and installs the newest compatible version in its place — even with
+`allow_reresolve: false`. The downgrade job then passes against versions it never
+meant to test.
+
+The action therefore promotes each floor-resolved test extra to `[deps]` in the
+checkout, so those names are on the path `Pkg.test` preserves. A promoted name
+that was a weak dependency is removed from `[weakdeps]`, since Pkg does not
+accept it in both tables; its `[extensions]` entry is untouched and the
+extension still loads. Only names the resolution actually placed in the manifest
+are promoted, so `no_promote` entries and stdlibs are left alone.
+
+Like the path-source promotions above, this intentionally leaves `Project.toml`
+modified for subsequent locked build and test steps.
+
 ## Downgrade Modes
 
 - **`deps`**: Minimize only your direct dependencies (recommended for most packages)
