@@ -301,6 +301,109 @@ function prepare_test_target_path_sources!(
 end
 
 """
+    registry_backed_manifest_entries(manifest_file) -> Dict{String, String}
+
+Map package name to uuid for every manifest entry that came from the registry,
+i.e. that carries both a resolved `version` and a `git-tree-sha1`. Stdlibs
+(no tree hash) and path/url entries (no version, or sourced in-tree) are
+excluded, so this is exactly the set of names holding a resolved floor.
+"""
+function registry_backed_manifest_entries(manifest_file::String)
+    entries = Dict{String, String}()
+    isfile(manifest_file) || return entries
+    manifest = TOML.parsefile(manifest_file)
+    # ≥1.7 manifests nest the package tables under `deps`; ≤1.6 manifests put
+    # them at the top level next to metadata scalars like `julia_version`.
+    deps = get(manifest, "deps", manifest)
+    for (name, stanzas) in deps
+        stanzas isa AbstractVector || continue
+        length(stanzas) == 1 || continue
+        entry = only(stanzas)
+        entry isa AbstractDict || continue
+        haskey(entry, "version") && haskey(entry, "git-tree-sha1") || continue
+        uuid = get(entry, "uuid", nothing)
+        uuid === nothing || (entries[name] = uuid)
+    end
+    return entries
+end
+
+"""
+    promote_test_target_registry_deps!(project_file, manifest_file) -> Vector{String}
+
+Promote registry-backed `[targets].test` dependencies into runtime `[deps]` and
+return the names promoted.
+
+`Pkg.test` does not run in the project environment. For an old-style layout it
+synthesizes a sandbox project out of `[deps]` plus the `[targets].test` names and
+resolves that, and a floor this action wrote to the manifest for a name reachable
+only through `[extras]`/`[weakdeps]` does not survive into the sandbox: the
+sandbox installs the newest compatible version instead, so the downgrade job
+tests versions it never meant to test and reports a false pass. Listing those
+names in `[deps]` puts them on the path `Pkg.test` does preserve.
+
+Only names the resolution actually placed in `manifest_file` as registry
+packages are promoted. That skips `no_promote` entries (deliberately left out of
+the joint floor-resolve, so they have no floor to keep) and stdlibs, and it keeps
+the project from declaring a dependency the locked manifest cannot satisfy.
+Path- and url-sourced names are left to `prepare_test_target_path_sources!`.
+"""
+function promote_test_target_registry_deps!(project_file::String, manifest_file::String)
+    project = TOML.parsefile(project_file)
+    test_target = get(get(project, "targets", Dict{String, Any}()), "test", String[])
+    isempty(test_target) && return String[]
+
+    deps = get(project, "deps", Dict{String, Any}())
+    extras = get(project, "extras", Dict{String, Any}())
+    weakdeps = get(project, "weakdeps", Dict{String, Any}())
+    sources = get(project, "sources", Dict{String, Any}())
+    resolved = registry_backed_manifest_entries(manifest_file)
+
+    promoted = String[]
+    for name in sort!(unique(String.(test_target)))
+        haskey(deps, name) && continue
+        haskey(sources, name) && continue
+
+        # `Pkg` resolves a test target through [extras] first, then [weakdeps].
+        uuid = get(extras, name, nothing)
+        weak_uuid = get(weakdeps, name, nothing)
+        if uuid === nothing
+            uuid = weak_uuid
+            uuid === nothing && continue
+        elseif weak_uuid !== nothing && weak_uuid != uuid
+            error(
+                "Test-target dependency $name has uuid $uuid in [extras], " *
+                    "but $weak_uuid in [weakdeps]"
+            )
+        end
+
+        resolved_uuid = get(resolved, name, nothing)
+        resolved_uuid === nothing && continue
+        resolved_uuid == uuid || error(
+            "Test-target dependency $name has uuid $uuid in $project_file, " *
+                "but $resolved_uuid in $manifest_file"
+        )
+        push!(promoted, name)
+    end
+    isempty(promoted) && return promoted
+
+    deps = get!(project, "deps", Dict{String, Any}())
+    for name in promoted
+        deps[name] = get(extras, name, get(weakdeps, name, nothing))
+        # A name cannot sit in both [deps] and [weakdeps]. Dropping it here
+        # matches what the merged project already did for the resolve, and the
+        # extension it triggers stays declared in [extensions] and still loads.
+        delete!(weakdeps, name)
+    end
+    isempty(weakdeps) && delete!(project, "weakdeps")
+
+    open(project_file, "w") do io
+        TOML.print(io, project)
+    end
+    @info "Promoted old-style test dependencies into [deps] for locked Pkg.test" promoted
+    return promoted
+end
+
+"""
     collect_path_sources(project_file; include_test_target = true) -> Vector{DirectPathSource}
 
 Collect local path packages that occur in `[sources]` and are active as runtime
@@ -985,6 +1088,7 @@ function resolve_directory(
                         project_file; no_promote
                     )
                 )
+                promote_test_target_registry_deps!(project_file, manifest_file)
                 add_main_package_to_manifest(manifest_file, project_file; path = ".")
                 if !isempty(source_pkgs)
                     add_source_packages_to_manifest(
